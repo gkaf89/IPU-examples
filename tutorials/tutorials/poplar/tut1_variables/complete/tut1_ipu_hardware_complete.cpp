@@ -6,91 +6,99 @@
 */
 
 #include <poplar/DeviceManager.hpp>
-#include <poplar/Engine.hpp>
+#include <poplar/Device.hpp>
+#include <poplar/Target.hpp>
+#include <poplar/Type.hpp>
 #include <poplar/Graph.hpp>
+#include <poplar/Tensor.hpp>
+#include <poplar/DataStream.hpp>
+#include <poplar/Engine.hpp>
 
 #include <algorithm>
 #include <iostream>
 
-using namespace poplar;
-
 int main() {
   // Create the DeviceManager which is used to discover devices
-  auto manager = DeviceManager::createDeviceManager();
+  poplar::DeviceManager manager = poplar::DeviceManager::createDeviceManager();
 
   // Attempt to attach to a single IPU:
-  auto devices = manager.getDevices(poplar::TargetType::IPU, 1);
+  std::vector<poplar::Device> devices = manager.getDevices(poplar::TargetType::IPU, 1);
   std::cout << "Trying to attach to IPU\n";
-  auto it = std::find_if(devices.begin(), devices.end(),
-                         [](Device &device) { return device.attach(); });
+  std::vector<poplar::Device>::iterator it = std::find_if(devices.begin(), devices.end(),
+                         [](poplar::Device &device) { return device.attach(); });
 
   if (it == devices.end()) {
     std::cerr << "Error attaching to device\n";
-    return 1; // EXIT_FAILURE
+    return EXIT_FAILURE;
   }
 
-  auto device = std::move(*it);
+  poplar::Device device(std::move(*it));
   std::cout << "Attached to IPU " << device.getId() << std::endl;
 
-  Target target = device.getTarget();
+  poplar::Target target = device.getTarget();
 
   // Create the Graph object
-  Graph graph(target);
+  poplar::Graph graph(target);
 
   // Add variables to the graph
-  Tensor v1 = graph.addVariable(FLOAT, {4}, "v1");
-  Tensor v2 = graph.addVariable(FLOAT, {4}, "v2");
-  Tensor v3 = graph.addVariable(FLOAT, {4, 4}, "v3");
-  Tensor v4 = graph.addVariable(INT, {10}, "v4");
+  poplar::Tensor v1 = graph.addVariable(poplar::FLOAT, {4}, "v1");
+  poplar::Tensor v2 = graph.addVariable(poplar::FLOAT, {4}, "v2");
+  poplar::Tensor v3 = graph.addVariable(poplar::FLOAT, {4, 4}, "v3");
+  poplar::Tensor v4 = graph.addVariable(poplar::INT, {10}, "v4");
 
   // Allocate v1 to reside on tile 0
   graph.setTileMapping(v1, 0);
 
   // Spread v2 over tiles 0..3
-  for (unsigned i = 0; i < 4; ++i)
+  for (size_t i = 0; i < 4; ++i ) {
     graph.setTileMapping(v2[i], i);
+  }
 
-  // Allocate v3, t4 to tile 0
-  graph.setTileMapping(v3, 0);
-  graph.setTileMapping(v4, 0);
+  // Allocate v3, t4 to tile 4
+  graph.setTileMapping(v3, 4);
+  graph.setTileMapping(v4, 4);
 
   // Create a control program that is a sequence of steps
-  program::Sequence prog;
+  poplar::program::Sequence prog;
 
   // Add a constant tensor to the graph
-  Tensor c1 = graph.addConstant<float>(FLOAT, {4}, {1.0, 1.5, 2.0, 2.5});
+  poplar::Tensor c1 = graph.addConstant<float>(poplar::FLOAT, {4}, {1.0, 1.5, 2.0, 2.5});
   graph.setTileMapping(c1, 0);
 
   // Add a step to initialize v1 with the constant value in c1
-  prog.add(program::Copy(c1, v1));
+  prog.add(poplar::program::Copy(c1, v1));
   // Debug print the tensor to the host console
-  prog.add(program::PrintTensor("v1-debug", v1));
+  prog.add(poplar::program::PrintTensor("v1-debug", v1));
 
   // Copy the data in v1 to v2
-  prog.add(program::Copy(v1, v2));
+  prog.add(poplar::program::Copy(v1, v2));
   // Debug print v2
-  prog.add(program::PrintTensor("v2-debug", v2));
+  prog.add(poplar::program::PrintTensor("v2-debug", v2));
 
-  // Create host read/write handles for v3
+  // Create host read/write handles for v3; the handles are FIFO objects
   graph.createHostWrite("v3-write", v3);
   graph.createHostRead("v3-read", v3);
 
   // Copy a slice of v1 into v3
-  Tensor v1slice = v1.slice(0, 3);
-  Tensor v3slice = v3.slice({1, 1}, {2, 4});
-  prog.add(program::Copy(v1slice, v3slice));
+  poplar::Tensor v1slice = v1.slice(0, 3); // begin @ 0 and for 3 elements <start+range>
+  poplar::Tensor v3slice = v3.slice({1, 1}, {2, 4}); // between [start, finish) <end points>
+  prog.add(poplar::program::Copy(v1slice, v3slice));
 
   // Add a data stream to fill v4
-  DataStream inStream = graph.addHostToDeviceFIFO("v4-input-stream", INT, 10);
+  poplar::DataStream inStream = graph.addHostToDeviceFIFO("v4-input-stream", poplar::INT, 10);
 
   // Add program steps to copy from the stream
-  prog.add(program::Copy(inStream, v4));
-  prog.add(program::PrintTensor("v4-0", v4));
-  prog.add(program::Copy(inStream, v4));
-  prog.add(program::PrintTensor("v4-1", v4));
+  prog.add(poplar::program::Copy(inStream, v4));
+  prog.add(poplar::program::PrintTensor("v4-0", v4));
+  prog.add(poplar::program::Copy(inStream, v4));
+  prog.add(poplar::program::PrintTensor("v4-1", v4));
+  prog.add(poplar::program::Copy(inStream, v4));
+  prog.add(poplar::program::PrintTensor("v4-2", v4));
+  prog.add(poplar::program::Copy(inStream, v4));
+  prog.add(poplar::program::PrintTensor("v4-3", v4));
 
   // Create the engine
-  Engine engine(graph, prog);
+  poplar::Engine engine(graph, prog);
   engine.load(device);
 
   // Copy host data via the write handle to v3 on the device
@@ -100,7 +108,9 @@ int main() {
   // Create a buffer to hold data to be fed via the data stream
   std::vector<int> inData(10 * 3);
   for (unsigned i = 0; i < 10 * 3; ++i)
+  {
     inData[i] = i;
+  }
 
   // Connect the data stream
   engine.connectStream("v4-input-stream", &inData[0], &inData[10 * 3]);
@@ -123,5 +133,5 @@ int main() {
     std::cout << "\n";
   }
 
-  return 0;
+  return EXIT_SUCCESS;
 }
